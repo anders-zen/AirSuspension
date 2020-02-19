@@ -1,0 +1,321 @@
+//To implement: Make valves and compressor turn on within one cycle of changing profiles....
+                    
+                    //INITIALIZING VALUES
+#include <EEPROM.h>
+//Height Settings
+int lowFr = 55;         //55              
+int lowRr = 37;         //33            
+int normalFr = 65;                
+int normalRr = 40;                
+int highFr = 70;                  
+int highRr = 48;                  
+int superHighFr = 91;             
+int superHighRr = 58;  
+//Adjustments
+int cargoPsi = 70;
+int rvPsi = 134;
+//int smoothTime = 200;
+float raw10Multiplier = .02;
+float raw90Multiplier = .98;
+int startupTime = 3000; 
+int adjInitialGap = 2;
+int adjNormalGap = 5;
+int adjWideGap = 13;                            //old was .21390 (120.0 / 561.0 for both)
+float frCalibration = 103.5 / 466.0;            // new fr is .22210 (new/old = 1.03833 off by 4% higher)
+float rrCalibration = 118 / 456.0;              // new rr is .25877 (new/old = 1.20977 off by 21% higher) old settings times ratio = new setting
+
+//Pin Allocations; ** means required for my installation
+const int frPressPin = A1;        //**pin number for rear yellow pressure sensor signal wire
+const int rrPressPin = A4;        //**pin number for front yellow pressure sensor signal wire
+const int rrRelayDn = 4;          //Shield Relay 4
+const int rrRelayUp = 5;          //Shield Relay 3
+const int frRelayDn = 6;          //Shield Relay 2
+const int frRelayUp = 7;          //Shield Relay 1 - pin numbers for output to relays
+const int buttonBPin = 2;
+const int confirmBLED = 3;         
+const int buttonAPin = 9;         //**pin numbers for input switch (grounded at arduino)
+const int remotePin4 = 11;        //Wireless Remote input pins are momentary 5v grounds from wireless controller
+const int confirmALED = 13;       //**When LED is on, on-board LED is on as well.  LOW is off, HIGH is on          
+//Blinky bits
+int ledStateA = LOW;
+int ledStateB = LOW;
+unsigned long pointInTimeA = 0;   //This will store last time LED cycle was restarted 
+unsigned long pointInTimeB = 0;
+unsigned long currentTimeA = 0;
+unsigned long currentTimeB = 0;
+unsigned long lastTimeA = 0;
+unsigned long lastTimeB = 0;
+long blipTime = 200;              // milliseconds of a single on/off cycle
+long longOnTime = 1000;
+int flashesA = 1;
+int flashesB = 1;
+int flashNumberA = 0;
+int flashNumberB = 0;
+int lastFlashStateA = 0;
+int lastFlashStateB = 0;
+//Profiles                        
+int settingA;                 //counter for the number of button presses for main profiles (A)
+int lastsettingA;  
+int settingB;                 //counter for the number of button presses additional weight profiles (B)
+int lastsettingB;                                                                          
+int frBase;  
+int frFinalTarget; 
+int frLastTarget;          
+int rrBase;
+int rrFinalTarget;
+int rrLastTarget;
+//Button Control
+int buttonAState;             //current state of the button
+int lastButtonAState;         //previous state of the button
+int buttonBState;                                                                              
+int lastbuttonBState; 
+//Pressures
+float frRaw10;
+float rrRaw10;
+float frRaw90;
+float rrRaw90;
+int actualFrRaw;
+int actualRrRaw;
+int actualFrPSI;
+int actualRrPSI;
+float smoothFrRaw;
+float smoothRrRaw;
+float smoothFrPSI;
+float smoothRrPSI; 
+int slowFrRaw;
+int slowRrRaw;
+int slowFrPSI;
+int slowRrPSI;
+boolean hasRun;           //This means when we select a Button2 profile - hasRun must be false so it'll grab new rear profile  
+//Smoothing
+unsigned long priorTime = 0;
+unsigned long currentTime;
+
+void setup() {
+//  delay(3000);
+  Serial.begin(19200); 
+  pinMode(rrRelayDn, OUTPUT);                 //Pin 4
+  pinMode(rrRelayUp, OUTPUT);                 //Pin 5         
+  pinMode(frRelayDn, OUTPUT);                 //Pin 6
+  pinMode(frRelayUp, OUTPUT);                 //Pin 7 
+  pinMode(confirmBLED, OUTPUT);               //Pin 8
+  pinMode(buttonAPin, INPUT_PULLUP);          //Pin 9
+  pinMode(buttonBPin, INPUT_PULLUP);          //Pin 10
+  pinMode(remotePin4, INPUT_PULLUP);          //Pin 11  
+  pinMode(confirmALED, OUTPUT);               //Pin 13
+readActualSensors();  
+smoothFrRaw = actualFrRaw;              //These are crucial to give the smoothing function the correct # to start with for averaging
+smoothRrRaw = actualRrRaw;
+frLastTarget = actualFrPSI;             //These give the pressButtonInitChange a baseline to correct on startup
+rrLastTarget = actualRrPSI;
+            }                                                    
+             
+void loop() {
+EEPROMOpen();
+profiles();
+buttonControls();
+readActualSensors();
+readSmoothedSensors();                  //Run this every smoothTime (200 ms currently)
+pressButtonInitChange();
+normalSuspAdjust(); 
+relaysOff();
+hasRuns();
+ledControl();
+serialMonitor();
+EEPROMClose();
+}
+
+void readSmoothedSensors() {          //MAKES SENSORS READABLE & IN PSI & SMOOTH THEM OUT      
+  currentTime = millis();
+  if (currentTime - priorTime > 200) {
+    // Front
+    frRaw10 = (analogRead(frPressPin) * raw10Multiplier);
+    frRaw90 = (smoothFrRaw * raw90Multiplier);           // calculate new rolling avg by adding 95% previous with 5% new
+    smoothFrRaw = (frRaw10 + frRaw90);           //These cause the new loop of 90s to be based on last loop's results                                          
+    // Rear
+    rrRaw10 = (analogRead(rrPressPin) * raw10Multiplier);                          
+    rrRaw90 = (smoothRrRaw * raw90Multiplier);
+    smoothRrRaw = (rrRaw10 + rrRaw90);         
+    // Convert
+    smoothFrPSI = (smoothFrRaw - 102.0) * (frCalibration); 
+    smoothRrPSI = (smoothRrRaw - 102.0) * (rrCalibration);
+    priorTime = currentTime;        }                                            // takes current time and sets it back for next cycle
+               }     
+                                   
+              //ACTUAL SENSOR READ
+void readActualSensors() {
+  actualRrRaw = analogRead(rrPressPin);                          //Pin selected for Rear 174 PSI 0-5v pressure sensor input
+  actualRrPSI = (actualRrRaw - 102) * (rrCalibration);      //Changes sys to PSI (sys readout minus 102 (.5v) which equals 0psi) 
+  actualFrRaw = analogRead(frPressPin);                          // times (120psi (sample) divided by (663 (sample) - 102) 561)
+  actualFrPSI = (actualFrRaw - 102) * (frCalibration);  }    //Process goes from PressPin (reading pin #) to Raw (0-1023) to PSI (math to get it to 0-174)
+
+          //THIS INITIATES ADJUSTMENT AFTER BUTTON PUSH
+void pressButtonInitChange() {                                              //If new FinalTarget is different than last one, raise or lower
+    if ((frFinalTarget != frLastTarget) && (smoothFrPSI < (frFinalTarget - adjInitialGap))) analogWrite(frRelayUp, 255);      //DOES THIS NEED TO TURN OTHER COMPRESS OFF WHEN RELEASING FOR RAPID BUTTON PUSHING CYCLING???
+    if ((frFinalTarget != frLastTarget) && (smoothFrPSI > (frFinalTarget + adjInitialGap))) analogWrite(frRelayDn, 255);
+    if ((rrFinalTarget != rrLastTarget) && (smoothRrPSI < (rrFinalTarget - adjInitialGap))) analogWrite(rrRelayUp, 255);
+    if ((rrFinalTarget != rrLastTarget) && (smoothRrPSI > (rrFinalTarget + adjInitialGap))) analogWrite(rrRelayDn, 255);
+  frLastTarget = frFinalTarget;
+  rrLastTarget = rrFinalTarget;                     }
+void normalSuspAdjust() {                                                    
+          //THIS TURNS RELAYS ON AT ANY TIME 
+  if (smoothFrPSI < (frFinalTarget - adjWideGap)) analogWrite(frRelayUp, 255);          //RELAYS ON             
+  if (smoothFrPSI > (frFinalTarget + adjWideGap)) analogWrite(frRelayDn, 255);
+  if (smoothRrPSI < (rrFinalTarget - adjWideGap)) analogWrite(rrRelayUp, 255);             
+  if (smoothRrPSI > (rrFinalTarget + adjWideGap)) analogWrite(rrRelayDn, 255);          }             
+          //THIS TURNS THE RELAYS OFF
+void relaysOff() {                                                            //Relays Off
+  if (smoothFrPSI > (frFinalTarget - 3)) analogWrite(frRelayUp, 0);              
+  if (smoothFrPSI < (frFinalTarget + 3)) analogWrite(frRelayDn, 0);
+  if (smoothRrPSI > (rrFinalTarget - 4)) analogWrite(rrRelayUp, 0);
+  if (smoothRrPSI < (rrFinalTarget + 3)) analogWrite(rrRelayDn, 0);                     }
+
+void profiles() {
+                    //BELOW ARE PRESSURE VALUES FOR MAIN PROFILES AND ADD-ON PRESSURES
+//These profiles change the values of frBase and rrBase in this loop.  They are the targets for psi for each profile.
+
+//LOW  
+if (settingA == 0)                      //LED OFF 
+      { frBase = lowFr;         
+        rrBase = lowRr;  } 
+//NORMAL  -        
+if (settingA == 1)                      //LED ON 
+      { frBase = normalFr;         
+        rrBase = normalRr;  }             
+//HIGHER -               
+if (settingA == 2)                      //LED 1 Blink    
+      { frBase = highFr;          
+        rrBase = highRr;   }        
+//SUPER HIGH - 
+if (settingA == 3)                      //LED 2 Blinks
+      { frBase = superHighFr;         
+        rrBase = superHighRr; } 
+                                                            //if any Button 2 addons are selected, these pressures get added to rear
+//Trailer Add-on Pressure                                   //this keeps the above numbers from adding every loop
+if ((hasRun == false) && (settingB == 0)) {  //LED OFF      ---------->  Dropped for Cleaning 
+    frFinalTarget = 30;
+    rrFinalTarget = 21;
+    hasRun = true;    }                                      
+if ((hasRun == false) && (settingB == 1)) {  //LED ON       ----------> Normal
+    frFinalTarget = frBase;
+    rrFinalTarget = rrBase;
+    hasRun = true;    }
+if ((hasRun == false) && (settingB == 2)) {  //LED 1 Blink  ----------> Cargo trailer
+    frFinalTarget = frBase;
+    rrFinalTarget = cargoPsi;                   
+    hasRun = true;    }
+if ((hasRun == false) && (settingB == 3)) {  //LED 2 BlinkS ----------> RV 
+    frFinalTarget = frBase;
+    rrFinalTarget = rvPsi;                      
+    hasRun = true;    } 
+}
+
+void buttonControls() {                    
+                    //BUTTONS CONTROLS    
+//Button 1 Control - Main Profiles
+  lastsettingA = settingA;                         //TEST CODE
+  buttonAState = digitalRead(buttonAPin);          //Read the pushbutton input pin:                              
+  if (buttonAState != lastButtonAState) {          //Compare the buttonAState to its previous state
+    if (buttonAState == LOW) {                    //If the state has changed, increment the counter
+      settingA++;      
+      digitalWrite(confirmALED, HIGH);            //Adds a blink when button is pressed (HIGH is LED on)
+      delay(40);
+      digitalWrite(confirmALED, LOW);}            //If the current state of LED is LOW then the button went from on to off:
+      delay(70);            }                    //Delay a little bit to avoid bouncing
+  lastButtonAState = buttonAState;                 //Save the current state as the last state, for next time through the loop
+  if (settingA >= 4) {
+    settingA = 0;                           }
+//Button 2 Control - Weight Adding Profiles
+  lastsettingB = settingB;                         //TEST CODE
+  buttonBState = digitalRead(buttonBPin);                               
+  if (buttonBState != lastbuttonBState) {      
+    if (buttonBState == LOW) {               
+      settingB++;      
+      digitalWrite(confirmBLED, HIGH);     
+      delay(40);
+      digitalWrite(confirmBLED, LOW);}       
+      delay(70);            }              
+  lastbuttonBState = buttonBState;                
+  if (settingB >= 4) {
+    settingB = 0;    }                       }
+
+
+void hasRuns() {
+  if (lastsettingA != settingA) hasRun = false;                              
+  if (lastsettingB != settingB) hasRun = false;                           //When we select a Button2 profile - hasRun must be false so it'll grab new rear profile                     
+}
+
+void ledControl() {              
+                    //LED PROGRAM   
+//Button 1 LED Control
+  unsigned long currentTimeA = millis();                                         
+    flashNumberA = (settingA -1) * 2;
+    lastTimeA = pointInTimeA + (blipTime * 10) + longOnTime;                                   
+    if (lastFlashStateA != flashesA) {                          // && settingA != 3
+      if (ledStateA == HIGH) ledStateA = LOW; 
+      else if (ledStateA == LOW) ledStateA = HIGH;   }
+    digitalWrite(confirmALED, ledStateA);  
+    lastFlashStateA = flashesA;
+    if ((currentTimeA >= pointInTimeA + (blipTime * flashesA) + (blipTime * 2)) &&         //if currentTime is in window of 100ms after NextTime, advance flashes #
+    (currentTimeA <= pointInTimeA + (blipTime * flashesA) + (blipTime * 2) + 100)) { 
+      flashesA++;                          }
+    if (flashesA >= flashNumberA) flashesA = 0;
+    if (currentTimeA >= lastTimeA) pointInTimeA = currentTimeA;   
+  if (settingA == 0) digitalWrite(confirmALED, LOW);
+  if (settingA == 1) digitalWrite(confirmALED, HIGH);
+//Button 2 LED Control
+  unsigned long currentTimeB = millis();                                         //say pointInTime is 1000
+    flashNumberB = (settingB -1) * 2;
+    lastTimeB = pointInTimeB + (blipTime * 10) + longOnTime;                                   
+    if (lastFlashStateB != flashesB) {
+      if (ledStateB == HIGH) ledStateB = LOW; 
+      else if (ledStateB == LOW) ledStateB = HIGH;   }
+    digitalWrite(confirmBLED, ledStateB);                                       //could have been this: if (settingB == 3) ledStateB = HIGH;
+    lastFlashStateB = flashesB;
+    if ((currentTimeB >= pointInTimeB + (blipTime * flashesB) + (blipTime * 2)) &&         //if currentTime is in window of 100ms after NextTime, advance flashes #
+    (currentTimeB <= pointInTimeB + (blipTime * flashesB) + (blipTime * 2) + 100)) { 
+      flashesB++;                          }
+    if (flashesB >= flashNumberB) flashesB = 0;
+    if (currentTimeB >= lastTimeB) pointInTimeB = currentTimeB;  
+  if (settingB == 0) digitalWrite(confirmBLED, LOW);
+  if (settingB == 1) digitalWrite(confirmBLED, HIGH);                                                                 
+}
+
+void serialMonitor() {              //SERIAL MONITOR ON COMPUTER                    
+  Serial.print("Set:");         //Profiles
+    Serial.print(settingA);
+    Serial.print("/");
+    Serial.print(settingB);
+  Serial.print("   Targ/Smooth/Act Fr--");           //Front
+    Serial.print(frFinalTarget);
+    Serial.print("--");
+    Serial.print(smoothFrPSI);
+    Serial.print("/");
+    Serial.print(actualFrPSI);
+  Serial.print("   Rr--");     //Rear
+    Serial.print(rrFinalTarget);
+    Serial.print("--");
+    Serial.print(smoothRrPSI);
+    Serial.print("/");
+    Serial.println(actualRrPSI);
+    
+}
+
+void EEPROMOpen() {                     //Occasionally the release valves will surge the arduino on release and reset it - this ensures the settings stay the same.
+    settingA = EEPROM.read(1);
+    settingB = EEPROM.read(2);
+    hasRun = EEPROM.read(3);
+    frFinalTarget = EEPROM.read(4);
+    rrFinalTarget = EEPROM.read(5);       }
+void EEPROMClose() {
+    EEPROM.write(1, settingA);
+    EEPROM.write(2, settingB);                          
+    EEPROM.write(3, hasRun); 
+    EEPROM.write(4, frFinalTarget);
+    EEPROM.write(5, rrFinalTarget);               
+}
+
+ 
+ */
+
+ 
